@@ -1,0 +1,37 @@
+[Unit]
+Description=Headless Scraping Subsystem (Imperva challenge solver)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=headless
+Group=headless
+WorkingDirectory=/opt/headless-scraping-subsystem
+EnvironmentFile=/etc/headless-scraping-subsystem.env
+ExecStart=/opt/headless-scraping-subsystem/.venv/bin/uvicorn app.main:app \
+          --host ${BIND_HOST} --port ${BIND_PORT} \
+          --workers 1 --log-level ${LOG_LEVEL}
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+RestrictRealtime=true
+MemoryHigh=2G
+MemoryMax=3G
+TasksMax=512
+
+# Playwright places its browser cache here at install time.
+ReadWritePaths=/opt/headless-scraping-subsystem
+
+[Install]
+WantedBy=multi-user.target
