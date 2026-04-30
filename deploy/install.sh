@@ -46,8 +46,18 @@ sudo -u "$SERVICE_USER" "$INSTALL_DIR/.venv/bin/pip" install \
 # 4. Playwright browser + system deps for Chromium
 echo "==> Installing Playwright Chromium"
 sudo -u "$SERVICE_USER" "$INSTALL_DIR/.venv/bin/playwright" install chromium
-# install-deps must run as root (apt-get inside)
-"$INSTALL_DIR/.venv/bin/playwright" install-deps chromium
+
+# `playwright install-deps chromium` is hardcoded for Ubuntu and breaks on
+# Debian (e.g. Trixie has no `ttf-ubuntu-font-family` / `ttf-unifont`). We
+# install the actually-needed runtime libraries directly. apt resolves the
+# `t64` time_t-transition variants on Trixie automatically.
+echo "==> Installing Chromium runtime libraries (Debian-safe list)"
+apt-get install -y --no-install-recommends \
+  libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+  libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+  libgbm1 libxkbcommon0 libpango-1.0-0 libasound2 libatspi2.0-0 \
+  libnss3 libnspr4 libxshmfence1 \
+  fonts-liberation fonts-noto-color-emoji fonts-unifont
 
 # 5. env file
 if [[ ! -f "$ENV_FILE" ]]; then
