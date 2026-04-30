@@ -16,6 +16,10 @@ Restart=on-failure
 RestartSec=5
 
 # Hardening
+# NB: Chromium uses AF_NETLINK for network change detection and unshare()
+# for its zygote sandbox, so we cannot enable LockPersonality and we must
+# allow AF_NETLINK in RestrictAddressFamilies. The remaining hardening is
+# still meaningful: no new privileges, read-only system, private /tmp.
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
@@ -23,8 +27,7 @@ PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictRealtime=true
 MemoryHigh=2G
 MemoryMax=3G

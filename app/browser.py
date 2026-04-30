@@ -183,8 +183,11 @@ class BrowserEngine:
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--disable-setuid-sandbox",
             ],
         )
+        log.info("Playwright/Chromium up; pool semaphore size=%d",
+                 settings.browser_pool_size)
 
     async def stop(self) -> None:
         # Close any sessions still open.
@@ -241,10 +244,14 @@ class BrowserEngine:
         async with self._lock:
             self._sessions[session.session_id] = session
 
-        # Hook routing — every outbound request goes through us.
-        await page.route("**/*", lambda route, request: asyncio.create_task(
-            self._on_route(session, route, request)
-        ))
+        # Hook routing — every outbound request goes through us. We define a
+        # proper async closure (not a lambda + create_task) so Playwright
+        # awaits the handler and Chromium's CDP sees the route as held until
+        # we explicitly fulfill/abort it.
+        async def _route_handler(route, request):
+            await self._on_route(session, route, request)
+
+        await page.route("**/*", _route_handler)
 
         # Kick off navigation in the background. The route handler will fire
         # for the very first request; the FastAPI handler will pick that up
@@ -393,6 +400,8 @@ class BrowserEngine:
         except Exception:
             req_headers = dict(request.headers or {})
 
+        log.info("session=%s queueing need_fetch req=%s %s %s",
+                 session.session_id, req_id, request.method, request.url)
         await session.events.put(NeedFetch(
             req_id=req_id,
             url=request.url,
