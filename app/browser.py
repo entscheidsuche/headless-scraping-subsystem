@@ -171,6 +171,19 @@ class BrowserEngine:
         self._sem = asyncio.Semaphore(settings.browser_pool_size)
         self._sessions: Dict[str, ChallengeSession] = {}
         self._lock = asyncio.Lock()
+        # Observability counters. ``_in_use`` mirrors the occupied pool slots
+        # (acquired in start_challenge, released in _cleanup) so we can log
+        # pool pressure without poking at the semaphore's private state.
+        self._in_use = 0
+        self._opened_total = 0
+        self._closed_total = 0
+        self._hb_task: Optional[asyncio.Task] = None
+
+    def _pool_stats(self) -> str:
+        pool = settings.browser_pool_size
+        return (f"in_use={self._in_use}/{pool} free={pool - self._in_use} "
+                f"sessions={len(self._sessions)} "
+                f"opened={self._opened_total} closed={self._closed_total}")
 
     # -- lifecycle -------------------------------------------------------
     async def start(self) -> None:
@@ -188,13 +201,34 @@ class BrowserEngine:
         )
         log.info("Playwright/Chromium up; pool semaphore size=%d",
                  settings.browser_pool_size)
+        if settings.heartbeat_interval_s > 0:
+            self._hb_task = asyncio.create_task(self._heartbeat())
+
+    async def _heartbeat(self) -> None:
+        """Periodically log pool occupancy so a pool that drains and never
+        recovers is visible in journalctl. Only emits when something is in
+        flight, to avoid spamming an idle log."""
+        interval = settings.heartbeat_interval_s
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if self._in_use > 0 or self._sessions:
+                    level = (log.warning
+                             if self._in_use >= settings.browser_pool_size
+                             else log.info)
+                    level("heartbeat: %s", self._pool_stats())
+        except asyncio.CancelledError:
+            pass
 
     async def stop(self) -> None:
+        if self._hb_task is not None:
+            self._hb_task.cancel()
+            self._hb_task = None
         # Close any sessions still open.
         async with self._lock:
             sessions = list(self._sessions.values())
         for s in sessions:
-            await self._cleanup(s)
+            await self._cleanup(s, reason="shutdown")
         if self._browser:
             await self._browser.close()
             self._browser = None
@@ -212,7 +246,18 @@ class BrowserEngine:
         # Reserve a slot from the pool. NB: we *acquire* without a timeout
         # here; FastAPI sets its own request timeout. If you want a hard
         # back-pressure ceiling, wrap this in asyncio.wait_for upstream.
+        if self._sem.locked():
+            log.warning(
+                "pool exhausted, /start is BLOCKING for a free slot "
+                "corr=%s (%s)", req.correlation_id, self._pool_stats(),
+            )
+        _wait_start = time.monotonic()
         await self._sem.acquire()
+        self._in_use += 1
+        self._opened_total += 1
+        waited = time.monotonic() - _wait_start
+        log.info("slot acquired corr=%s waited=%.1fs (%s)",
+                 req.correlation_id, waited, self._pool_stats())
 
         try:
             ua = req.user_agent or DEFAULT_UA
@@ -232,7 +277,10 @@ class BrowserEngine:
 
             page = await context.new_page()
         except Exception:
+            self._in_use = max(0, self._in_use - 1)
             self._sem.release()
+            log.exception("context/page creation failed corr=%s (%s)",
+                          req.correlation_id, self._pool_stats())
             raise
 
         session = ChallengeSession(
@@ -243,6 +291,8 @@ class BrowserEngine:
         )
         async with self._lock:
             self._sessions[session.session_id] = session
+        log.info("session opened sid=%s corr=%s (%s)",
+                 session.session_id, req.correlation_id, self._pool_stats())
 
         # Hook routing — every outbound request goes through us. We define a
         # proper async closure (not a lambda + create_task) so Playwright
@@ -263,8 +313,9 @@ class BrowserEngine:
         async with self._lock:
             return self._sessions.get(session_id)
 
-    async def close_session(self, session: ChallengeSession) -> None:
-        await self._cleanup(session)
+    async def close_session(self, session: ChallengeSession,
+                            reason: str = "unspecified") -> None:
+        await self._cleanup(session, reason=reason)
 
     # -- internals -------------------------------------------------------
     async def _drive(self, session: ChallengeSession, req: StartRequest) -> None:
@@ -301,6 +352,11 @@ class BrowserEngine:
                 )
                 # Treat the fetch result as the final document.
                 cookies = await session.context.cookies()
+                duration = time.monotonic() - session.started_at
+                log.info("challenge done (non-GET) sid=%s corr=%s status=%s "
+                         "fetches=%d duration=%.1fs",
+                         session.session_id, session.correlation_id,
+                         resp_text["status"], session.fetch_count, duration)
                 await session.events.put(ChallengeDone(
                     session_id=session.session_id,
                     correlation_id=session.correlation_id,
@@ -310,7 +366,7 @@ class BrowserEngine:
                     cookies=cookies,
                     headers={k.title(): v for k, v in (resp_text["headers"] or {}).items()},
                     fetch_count=session.fetch_count,
-                    duration_s=time.monotonic() - session.started_at,
+                    duration_s=duration,
                 ))
                 return
 
@@ -336,6 +392,11 @@ class BrowserEngine:
             headers = {k.title(): v for k, v in
                        (await response.all_headers()).items()} if response else {}
 
+            duration = time.monotonic() - session.started_at
+            log.info("challenge done sid=%s corr=%s status=%s fetches=%d "
+                     "duration=%.1fs", session.session_id,
+                     session.correlation_id, status_code,
+                     session.fetch_count, duration)
             await session.events.put(ChallengeDone(
                 session_id=session.session_id,
                 correlation_id=session.correlation_id,
@@ -345,10 +406,13 @@ class BrowserEngine:
                 cookies=cookies,
                 headers=headers,
                 fetch_count=session.fetch_count,
-                duration_s=time.monotonic() - session.started_at,
+                duration_s=duration,
             ))
         except Exception as e:  # pragma: no cover - defensive
-            log.exception("challenge drive failed: %s", e)
+            log.exception("challenge drive failed sid=%s corr=%s fetches=%d "
+                          "duration=%.1fs: %s", session.session_id,
+                          session.correlation_id, session.fetch_count,
+                          time.monotonic() - session.started_at, e)
             await session.events.put(ChallengeError(
                 session_id=session.session_id,
                 correlation_id=session.correlation_id,
@@ -370,8 +434,9 @@ class BrowserEngine:
 
         if session.fetch_count >= settings.max_fetches_per_challenge:
             log.warning(
-                "session=%s exceeded max_fetches_per_challenge=%d",
-                session.session_id, settings.max_fetches_per_challenge,
+                "session=%s corr=%s exceeded max_fetches_per_challenge=%d",
+                session.session_id, session.correlation_id,
+                settings.max_fetches_per_challenge,
             )
             try:
                 await route.abort()
@@ -400,8 +465,9 @@ class BrowserEngine:
         except Exception:
             req_headers = dict(request.headers or {})
 
-        log.info("session=%s queueing need_fetch req=%s %s %s",
-                 session.session_id, req_id, request.method, request.url)
+        log.info("session=%s corr=%s queueing need_fetch #%d req=%s %s %s",
+                 session.session_id, session.correlation_id,
+                 session.fetch_count, req_id, request.method, request.url)
         await session.events.put(NeedFetch(
             req_id=req_id,
             url=request.url,
@@ -417,7 +483,10 @@ class BrowserEngine:
                 future, timeout=settings.feed_wait_timeout_s
             )
         except asyncio.TimeoutError:
-            log.warning("session=%s req=%s feed timeout", session.session_id, req_id)
+            log.warning("session=%s corr=%s req=%s feed timeout after %.0fs "
+                        "(caller stopped feeding — likely slot leak source)",
+                        session.session_id, session.correlation_id, req_id,
+                        settings.feed_wait_timeout_s)
             try:
                 await route.abort()
             except Exception:
@@ -442,14 +511,15 @@ class BrowserEngine:
                 body=body,
             )
         except Exception as e:
-            log.warning("session=%s req=%s fulfill failed: %s",
-                        session.session_id, req_id, e)
+            log.warning("session=%s corr=%s req=%s fulfill failed: %s",
+                        session.session_id, session.correlation_id, req_id, e)
             try:
                 await route.abort()
             except Exception:
                 pass
 
-    async def _cleanup(self, session: ChallengeSession) -> None:
+    async def _cleanup(self, session: ChallengeSession,
+                       reason: str = "unspecified") -> None:
         if session.closed:
             return
         session.closed = True
@@ -469,8 +539,15 @@ class BrowserEngine:
             self._sessions.pop(session.session_id, None)
         try:
             self._sem.release()
+            self._in_use = max(0, self._in_use - 1)
+            self._closed_total += 1
         except ValueError:
             pass
+        log.info("session closed sid=%s corr=%s reason=%s fetches=%d "
+                 "duration=%.1fs (%s)",
+                 session.session_id, session.correlation_id, reason,
+                 session.fetch_count, time.monotonic() - session.started_at,
+                 self._pool_stats())
 
 
 def _cookies_for_playwright(cookies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

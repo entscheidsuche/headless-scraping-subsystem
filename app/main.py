@@ -29,7 +29,7 @@ from .protocol import (
 
 
 logging.basicConfig(
-    level=getattr(logging, settings.log_level, logging.INFO),
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("headless")
@@ -87,14 +87,15 @@ async def challenge_start(req: StartRequest) -> JSONResponse:
     try:
         event = await session.next_event(timeout=settings.challenge_timeout_s)
     except Exception as e:
-        await engine.close_session(session)
+        await engine.close_session(session, reason="start_event_timeout")
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail=f"engine timeout waiting for first event: {e!r}",
         )
 
     if isinstance(event, (ChallengeDone, ChallengeError)):
-        await engine.close_session(session)
+        reason = "done" if isinstance(event, ChallengeDone) else "error"
+        await engine.close_session(session, reason=reason)
     return JSONResponse(content=event.model_dump(mode="json"))
 
 
@@ -129,14 +130,15 @@ async def challenge_feed(req_id: str, feed: FeedFetch,
     try:
         event = await session.next_event(timeout=settings.challenge_timeout_s)
     except Exception as e:
-        await engine.close_session(session)
+        await engine.close_session(session, reason="feed_event_timeout")
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail=f"engine timeout waiting for next event: {e!r}",
         )
 
     if isinstance(event, (ChallengeDone, ChallengeError)):
-        await engine.close_session(session)
+        reason = "done" if isinstance(event, ChallengeDone) else "error"
+        await engine.close_session(session, reason=reason)
     return JSONResponse(content=event.model_dump(mode="json"))
 
 
@@ -151,5 +153,5 @@ async def challenge_cancel(session_id: str) -> dict:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"unknown session_id {session_id!r}",
         )
-    await engine.close_session(session)
+    await engine.close_session(session, reason="cancel")
     return {"cancelled": session_id}

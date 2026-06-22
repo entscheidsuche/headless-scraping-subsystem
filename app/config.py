@@ -66,11 +66,17 @@ class Settings:
     )
 
     # --- Logging --------------------------------------------------------
-    log_level: str = os.environ.get("LOG_LEVEL", "INFO").upper()
+    # uvicorn requires lowercase. Python's `logging` accepts upper or lower
+    # via getattr(); we normalise here to the lowercase form.
+    log_level: str = os.environ.get("LOG_LEVEL", "info").lower()
 
     # --- Operational ----------------------------------------------------
     # Maximum number of outbound fetches a single challenge solve may issue.
     max_fetches_per_challenge: int = _env_int("MAX_FETCHES_PER_CHALLENGE", 50)
+    # Interval (seconds) for the pool-status heartbeat log line. 0 disables it.
+    # Logs active sessions / free slots so a pool that drains and never recovers
+    # is visible in journalctl.
+    heartbeat_interval_s: float = _env_float("HEARTBEAT_INTERVAL_S", 60.0)
 
 
 settings = Settings()
