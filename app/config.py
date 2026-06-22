@@ -52,6 +52,12 @@ class Settings:
     browser_pool_size: int = _env_int("BROWSER_POOL_SIZE", 2)
     # Per-challenge ceiling: a single solve must not exceed this many seconds
     challenge_timeout_s: float = _env_float("CHALLENGE_TIMEOUT_S", 60.0)
+    # After the initial navigation lands on the Imperva interstitial, how long
+    # to keep polling for the challenge to clear (the JS sets a cookie and
+    # reloads to the real page). If it never clears within this budget the
+    # solve is treated as failed (likely bot-detected) rather than returning
+    # the interstitial as a false success.
+    clearance_timeout_s: float = _env_float("CLEARANCE_TIMEOUT_S", 30.0)
     # Per-feed wait: the browser pauses on each outbound fetch and waits for
     # Scrapy Cloud to feed the response via /feed. This is the upper bound.
     feed_wait_timeout_s: float = _env_float("FEED_WAIT_TIMEOUT_S", 45.0)

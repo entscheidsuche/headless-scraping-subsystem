@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -43,6 +44,17 @@ from .protocol import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# Marker present in every Imperva/Incapsula interstitial (the 212-byte stub and
+# the larger iframe loader both reference this resource). The real target page
+# never contains it, so its absence is our "challenge cleared" signal.
+_IMPERVA_INTERSTITIAL_MARKER = re.compile(r"_Incapsula_Resource", re.IGNORECASE)
+
+
+def _is_imperva_interstitial(html: Optional[str]) -> bool:
+    """True while the page is still an Imperva challenge/interstitial page."""
+    return bool(html) and bool(_IMPERVA_INTERSTITIAL_MARKER.search(html))
 
 
 # Default UA used when the caller doesn't supply one. Matches a recent stable
@@ -318,6 +330,18 @@ class BrowserEngine:
         await self._cleanup(session, reason=reason)
 
     # -- internals -------------------------------------------------------
+    @staticmethod
+    async def _safe_content(page) -> Optional[str]:
+        """page.content() that tolerates an in-flight navigation/reload.
+
+        While Imperva reloads the page the execution context is torn down and
+        ``content()`` raises; we return None so the caller keeps polling instead
+        of crashing or mistaking a transient failure for a cleared page."""
+        try:
+            return await page.content()
+        except Exception:
+            return None
+
     async def _drive(self, session: ChallengeSession, req: StartRequest) -> None:
         """Navigate the page; on completion, capture the result."""
         try:
@@ -376,23 +400,55 @@ class BrowserEngine:
                 timeout=int(settings.challenge_timeout_s * 1000),
             )
 
-            # Imperva pages reload themselves once the challenge cookie is set.
-            # Wait briefly for the network to quiet down before we snapshot.
-            try:
-                await session.page.wait_for_load_state(
-                    "networkidle", timeout=10_000
-                )
-            except Exception:
-                # networkidle is best-effort; fall through with what we have.
-                pass
+            # domcontentloaded fires on the *interstitial*. Imperva then runs a
+            # JS challenge that sets a clearance cookie and reloads to the real
+            # page. We must keep the page alive and poll until the Incapsula
+            # marker is gone — only then are the cookies actually valid. Each
+            # reload re-enters _on_route, so the spider keeps feeding upstream
+            # responses while we wait. If it never clears within the budget the
+            # challenge was not solved (most likely bot-detected); we surface a
+            # ChallengeError rather than return the interstitial as a false
+            # "done" (which previously caused an endless re-challenge loop).
+            deadline = time.monotonic() + settings.clearance_timeout_s
+            html = await self._safe_content(session.page)
+            while _is_imperva_interstitial(html) or html is None:
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    await session.page.wait_for_load_state(
+                        "networkidle", timeout=3_000
+                    )
+                except Exception:
+                    # Best-effort; the page may be mid-reload (context churns).
+                    pass
+                await asyncio.sleep(0.5)
+                html = await self._safe_content(session.page)
 
-            html = await session.page.content()
             cookies = await session.context.cookies()
+            duration = time.monotonic() - session.started_at
+
+            if _is_imperva_interstitial(html) or html is None:
+                log.warning(
+                    "challenge UNSOLVED (still interstitial) sid=%s corr=%s "
+                    "fetches=%d duration=%.1fs",
+                    session.session_id, session.correlation_id,
+                    session.fetch_count, duration,
+                )
+                await session.events.put(ChallengeError(
+                    session_id=session.session_id,
+                    correlation_id=session.correlation_id,
+                    code="challenge_unsolved",
+                    message=(
+                        "Imperva interstitial still present after "
+                        f"{settings.clearance_timeout_s:.0f}s — challenge not cleared"
+                    ),
+                ))
+                return
+
             status_code = response.status if response else 0
             headers = {k.title(): v for k, v in
                        (await response.all_headers()).items()} if response else {}
 
-            duration = time.monotonic() - session.started_at
             log.info("challenge done sid=%s corr=%s status=%s fetches=%d "
                      "duration=%.1fs", session.session_id,
                      session.correlation_id, status_code,
